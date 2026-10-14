@@ -1,0 +1,710 @@
+"""
+Blender Python Script: Bake Pyramid VAT assets.
+
+Generates:
+  - pyramids_merged.glb  (merged pyramid base mesh for VAT rendering)
+  - pyramids_vat.bin     (per-object ABSOLUTE world transform per frame, Y-up)
+  - pyramids_source.glb  (pyramid particle/remesh hierarchy only, with animation)
+
+The source GLB is exported from the fallback scene asset so runtime does not need
+to load the full legacy DAO scene just to recover pyramid particle animation.
+"""
+
+import bpy
+import bmesh
+import numpy as np
+import struct
+import gzip
+import os
+import sys
+import mathutils
+
+# ── Configuration ──────────────────────────────────────────────────
+# Sample every Nth frame. The runtime particle cloud is driven by the source
+# GLB's full-resolution AnimationMixer, while the solid pyramids are this baked
+# VAT, linearly interpolated between baked keys in the shader. Any step > 1 lets
+# the two diverge wherever the motion is faster than the bake cadence — the new
+# source has near-instant (1-frame) positional jumps, so step=6 smeared a
+# 1-frame jump across 0.1s and the cloud visibly separated from the solid mesh
+# and flickered on scrub. step=1 makes the VAT sample exactly the frames the
+# mixer does, so they stay locked together. The trailing static held pose is
+# trimmed below, so this does not bloat the .bin with duplicate frames — but it
+# is still the dominant size lever (raise to 2 to roughly halve the .bin at the
+# cost of a 1-frame mismatch through the fastest jumps, which fall under the
+# cloud cover at progress ~0.41).
+FRAME_STEP = 1
+# glTF carries no fps, so a re-imported GLB defaults to Blender's 24fps. The
+# source animation is authored at 60fps; pin it here so the bake samples the
+# native frame resolution (~2801 frames) instead of a 24fps-resampled subset.
+SOURCE_FPS = 60
+PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# Bake straight from the FBX. A GLB round-trip silently drops the per-object
+# pyramid animation: SCENE export mode collapses to a single channel and ACTIONS
+# mode re-imports as muted NLA tracks that don't evaluate on frame_set — either
+# way the VAT freezes at the rest pose. FBX import makes every action active, so
+# frame_set evaluates the full morph.
+SOURCE_INPUT = os.path.join(PROJECT_DIR, "static/models/DAO_60fps_01.fbx")
+GLB_INPUT = SOURCE_INPUT
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "static/models")
+MESH_OUTPUT = os.path.join(OUTPUT_DIR, "pyramids_merged.glb")
+VAT_OUTPUT = os.path.join(OUTPUT_DIR, "pyramids_vat.bin")
+SOURCE_OUTPUT = os.path.join(OUTPUT_DIR, "pyramids_source.glb")
+PYRAMID_ROOT_CANDIDATES = ("pyramids_1", "Pyramids")
+
+# `--mobile` (after Blender's `--` separator) bakes the mobile variant from the
+# mobile FBX into pyramids_mobile_* — same format, fewer objects. Usage:
+#   blender --background --python scripts/bake_pyramid_vat.py -- --mobile
+#   node scripts/optimize_mobile_scene.mjs static/models/pyramids_mobile_source.glb
+_script_args = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
+if "--mobile" in _script_args:
+    SOURCE_INPUT = os.path.join(PROJECT_DIR, "static/models/DAO_60fps_mobile_07.fbx")
+    GLB_INPUT = SOURCE_INPUT
+    MESH_OUTPUT = os.path.join(OUTPUT_DIR, "pyramids_mobile_merged.glb")
+    VAT_OUTPUT = os.path.join(OUTPUT_DIR, "pyramids_mobile_vat.bin")
+    SOURCE_OUTPUT = os.path.join(OUTPUT_DIR, "pyramids_mobile_source.glb")
+# ───────────────────────────────────────────────────────────────────
+
+
+def clear_scene():
+    """Remove all objects from the scene."""
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete(use_global=False)
+    for block in bpy.data.meshes:
+        if block.users == 0:
+            bpy.data.meshes.remove(block)
+    # Purge orphaned actions too — a second import otherwise name-collides into
+    # `Action.001` suffixes and doubles bpy.data.actions.
+    for action in list(bpy.data.actions):
+        if action.users == 0:
+            bpy.data.actions.remove(action)
+
+
+def import_glb(filepath):
+    """Import a source file (FBX or GLB) by extension."""
+    print(f"Importing {filepath}...")
+    if filepath.lower().endswith(".fbx"):
+        bpy.ops.import_scene.fbx(filepath=filepath)
+    else:
+        bpy.ops.import_scene.gltf(filepath=filepath)
+    print(f"  Imported {len(bpy.data.objects)} objects")
+
+
+def find_object_by_name(name):
+    """Find an object by name in the scene."""
+    for obj in bpy.data.objects:
+        if obj.name == name or obj.name.startswith(name + '.'):
+            return obj
+    return None
+
+
+def find_pyramid_root():
+    """
+    Resolve the pyramid root group in a schema-tolerant way.
+    Supports legacy DAO.glb (pyramids_1) and newer exports (Pyramids).
+    """
+    for candidate in PYRAMID_ROOT_CANDIDATES:
+        root = find_object_by_name(candidate)
+        if root is not None:
+            return root
+
+    # Fallback: any object with "pyramid" in name
+    for obj in bpy.data.objects:
+        if "pyramid" in obj.name.lower():
+            return obj
+
+    available = sorted([o.name for o in bpy.data.objects if o.name])[:40]
+    raise ValueError(
+        "Pyramid root not found. Tried "
+        + str(PYRAMID_ROOT_CANDIDATES)
+        + " and name contains 'pyramid'. "
+        + "Available objects (first 40): "
+        + str(available)
+    )
+
+
+def get_pyramid_base_meshes():
+    """Find solid pyramid mesh objects under pyramid root.
+
+    Skips entire *particle* subtrees — those nodes (and their *_remesh leaves)
+    are particle-source geometry the runtime turns into particle systems.
+    Standalone *_remesh meshes that live OUTSIDE a particle subtree (e.g.
+    Polygon_remesh under Glass_2_2) are kept: they're real solid pyramid bodies
+    not covered by any other VAT mesh.
+    """
+    root = find_pyramid_root()
+
+    print(f"Found root: {root.name}")
+    meshes = []
+
+    def collect(obj):
+        name_lower = obj.name.lower()
+        if 'particle' in name_lower:
+            return
+        if obj.type == 'MESH':
+            meshes.append(obj)
+        for child in obj.children:
+            collect(child)
+
+    collect(root)
+    return meshes
+
+
+def collect_pyramid_subtree(root):
+    """Collect the pyramid root and all descendants."""
+    result = []
+
+    def collect(obj):
+        result.append(obj)
+        for child in obj.children:
+            collect(child)
+
+    collect(root)
+    return result
+
+
+def remove_pyramid_base_meshes(root):
+    """Delete non-particle pyramid base meshes, keeping particle/remesh hierarchy."""
+    to_remove = []
+
+    def collect(obj):
+        name_lower = obj.name.lower()
+        if obj.type == 'MESH' and 'particle' not in name_lower and '_remesh' not in name_lower:
+            to_remove.append(obj)
+            return
+        for child in obj.children:
+            collect(child)
+
+    collect(root)
+
+    for obj in to_remove:
+        mesh_data = obj.data if obj.type == 'MESH' else None
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh_data and mesh_data.users == 0:
+            bpy.data.meshes.remove(mesh_data)
+
+    return len(to_remove)
+
+
+def bake_absolute_transforms(base_meshes, frames, scene):
+    """
+    Bake ABSOLUTE world transforms per object per frame.
+
+    Converts from Blender Z-up to glTF Y-up coordinate system:
+      mat_gltf = C @ mat_blender @ C_inv
+
+    The shader applies this directly to local-space vertices (which the
+    glTF exporter also converted to Y-up), giving correct Y-up world positions.
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    n_objects = len(base_meshes)
+    n_frames = len(frames)
+    transforms = np.empty((n_frames, n_objects, 3, 4), dtype=np.float32)
+
+    # Blender Z-up → glTF Y-up: rotate -90° around X
+    C = np.array([
+        [1,  0,  0,  0],
+        [0,  0,  1,  0],
+        [0, -1,  0,  0],
+        [0,  0,  0,  1],
+    ], dtype=np.float64)
+    C_inv = np.array([
+        [1,  0,  0,  0],
+        [0,  0, -1,  0],
+        [0,  1,  0,  0],
+        [0,  0,  0,  1],
+    ], dtype=np.float64)
+
+    for fi, frame in enumerate(frames):
+        scene.frame_set(frame)
+        depsgraph.update()
+
+        for oi, obj in enumerate(base_meshes):
+            eval_obj = obj.evaluated_get(depsgraph)
+            mat = np.array(eval_obj.matrix_world, dtype=np.float64)
+            # Convert to Y-up: C * mat * C_inv
+            mat_gltf = C @ mat @ C_inv
+            transforms[fi, oi] = mat_gltf[:3, :].astype(np.float32)
+
+        if fi % 30 == 0 or fi == n_frames - 1:
+            print(f"  Baked frame {fi + 1}/{n_frames} (scene frame {frame})")
+
+    return transforms
+
+
+def build_merged_mesh(base_meshes):
+    """
+    Merge all base meshes into one in LOCAL object space (no world transform).
+    The shader applies the world transform from the VAT.
+    Stores objectIndex as a vertex color layer.
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    bm = bmesh.new()
+
+    obj_idx_layer = bm.verts.layers.float.new('objectIndex')
+
+    for oi, obj in enumerate(base_meshes):
+        eval_obj = obj.evaluated_get(depsgraph)
+        eval_mesh = eval_obj.to_mesh()
+
+        old_vert_count = len(bm.verts)
+
+        bm.from_mesh(eval_mesh)
+        bm.verts.ensure_lookup_table()
+
+        # NO world transform — keep vertices in local object space
+        # Just set the objectIndex
+        for vi in range(old_vert_count, len(bm.verts)):
+            bm.verts[vi][obj_idx_layer] = float(oi)
+
+        eval_obj.to_mesh_clear()
+
+    bm.normal_update()
+
+    mesh_data = bpy.data.meshes.new("PyramidsMerged")
+    bm.to_mesh(mesh_data)
+    bm.free()
+    mesh_data.update()
+
+    n_verts = len(mesh_data.vertices)
+
+    # Read objectIndex from the float attribute
+    obj_indices = np.zeros(n_verts, dtype=np.float32)
+    if 'objectIndex' in mesh_data.attributes:
+        attr = mesh_data.attributes['objectIndex']
+        for i in range(n_verts):
+            obj_indices[i] = attr.data[i].value
+    else:
+        vert_offset = 0
+        for oi, obj in enumerate(base_meshes):
+            eval_obj = obj.evaluated_get(depsgraph)
+            eval_mesh = eval_obj.to_mesh()
+            nv = len(eval_mesh.vertices)
+            obj_indices[vert_offset:vert_offset + nv] = float(oi)
+            vert_offset += nv
+            eval_obj.to_mesh_clear()
+
+    max_idx = len(base_meshes) - 1
+    if max_idx == 0:
+        max_idx = 1
+
+    if 'objectIndex' in mesh_data.attributes:
+        mesh_data.attributes.remove(mesh_data.attributes['objectIndex'])
+
+    color_attr = mesh_data.color_attributes.new(
+        name='objectIndex',
+        type='FLOAT_COLOR',
+        domain='CORNER'
+    )
+
+    for poly in mesh_data.polygons:
+        for loop_idx in poly.loop_indices:
+            vi = mesh_data.loops[loop_idx].vertex_index
+            idx = int(obj_indices[vi])
+            color_attr.data[loop_idx].color = (idx / 512.0, 0.0, 0.0, 1.0)
+
+    mesh_data.update()
+
+    merged_obj = bpy.data.objects.new("PyramidsMerged", mesh_data)
+    bpy.context.collection.objects.link(merged_obj)
+
+    return merged_obj, n_verts, max_idx + 1
+
+
+def export_merged_glb(merged_obj, output_path):
+    """Export the merged mesh as GLB."""
+    bpy.ops.object.select_all(action='DESELECT')
+    merged_obj.select_set(True)
+    bpy.context.view_layer.objects.active = merged_obj
+
+    bpy.ops.export_scene.gltf(
+        filepath=output_path,
+        use_selection=True,
+        export_format='GLB',
+        export_animations=False,
+        export_normals=True,
+        export_materials='NONE',
+        export_extras=True,
+        export_apply=False,
+        export_attributes=True,
+    )
+    size_kb = os.path.getsize(output_path) / 1024
+    print(f"Exported mesh: {output_path} ({size_kb:.1f} KB)")
+
+
+def bake_local_actions(objs, scene, rest_frame, root, frozen_root_world):
+    """Re-bake each object's EVALUATED local transform per frame into fresh
+    native keyframes.
+
+    Blender 5.2's glTF exporter mis-samples FBX-imported (slotted) actions in
+    ACTIONS mode: translation/rotation channels export fine but every SCALE
+    channel comes out all-zero — the runtime mixer then poses the particle
+    sources to scale 0 forever and the cloud never appears. The depsgraph
+    evaluation itself is correct, so capture the evaluated local TRS per frame,
+    write it as plain keyframes, and export those verbatim (force sampling off).
+
+    MUST run while the root's OWN animation is still active: the root gets
+    frozen static afterwards (pivot-safety), but in the mobile FBX it carries
+    real in-window motion (a slow spin + the scale gate) that the VAT bakes
+    into its absolute world transforms. To keep source and VAT frame-locked,
+    the root's true motion is FOLDED into its direct children — their locals
+    are captured as `frozenRootWorld⁻¹ × trueChildWorld(t)`, so under the
+    frozen root the chain recomposes to the exact FBX world at every frame:
+      frozenRoot × [frozenRoot⁻¹·W₁(t)] × [W₁(t)⁻¹·W₂(t)] × … = Wₙ(t).
+    """
+    deps = bpy.context.evaluated_depsgraph_get()
+    frames = list(range(scene.frame_start, scene.frame_end + 1))
+    frozen_root_inv = frozen_root_world.inverted_safe()
+
+    captured = {o.name: [] for o in objs}
+    for fi, f in enumerate(frames):
+        scene.frame_set(f)
+        deps.update()
+        for o in objs:
+            eo = o.evaluated_get(deps)
+            if o.parent is root:
+                # Fold the root's true motion relative to its frozen pose.
+                m = frozen_root_inv @ eo.matrix_world
+            elif o.parent:
+                # inverted_safe: ancestors can sit at exact scale-0 outside their
+                # display window; the fallback yields a ~zero local there, which
+                # poses the mesh at scale 0 — correctly unbindable at that frame.
+                m = o.parent.evaluated_get(deps).matrix_world.inverted_safe() @ eo.matrix_world
+            else:
+                m = eo.matrix_world.copy()
+            loc, rot, sc = m.decompose()
+            prev = captured[o.name][-1] if captured[o.name] else None
+            # Quaternion sign continuity: q and −q are the same rotation, but a
+            # LINEAR curve interpolating across a sign flip sweeps through junk.
+            if prev is not None and prev[1].dot(rot) < 0:
+                rot = -rot
+            captured[o.name].append((loc, rot, sc))
+        if fi % 500 == 0 or fi == len(frames) - 1:
+            print(f"  captured frame {fi + 1}/{len(frames)}")
+
+    # Base TRS the nodes are EXPORTED with (what three.js sees until the mixer
+    # first poses them). Must be the displayed pose at `rest_frame` (the root's
+    # freeze frame), NOT wherever the keyframing loop happened to end: the
+    # runtime builds the rotation pivot from a Box3 of this rest pose BEFORE any
+    # mixer tick, and the frame-2801 end pose (collapsed/flown out) put the
+    # pivot center far off the pyramids — the idle auto-spin orbited the whole
+    # group around that phantom center.
+    rest_index = frames.index(rest_frame) if rest_frame in frames else 0
+
+    # Write fcurves DIRECTLY via the slotted-action API — NOT keyframe_insert.
+    # Each keyframe_insert triggers an animation re-evaluation that overwrites
+    # the object's pending TRS from the partially-built action before the next
+    # property's insert reads it: location survived (inserted first), but
+    # rotation/scale keys silently recorded stale evaluated values — the
+    # display-window scale pops landed at garbled times and the cloud vanished.
+    def write_channel(cb, data, path, ncomp, get):
+        n = len(frames)
+        for idx in range(ncomp):
+            fc = cb.fcurves.new(path, index=idx)
+            fc.keyframe_points.add(n)
+            flat = [0.0] * (2 * n)
+            for i in range(n):
+                flat[2 * i] = frames[i]
+                flat[2 * i + 1] = get(data[i], idx)
+            fc.keyframe_points.foreach_set('co', flat)
+            for k in fc.keyframe_points:
+                k.interpolation = 'LINEAR'
+            fc.update()
+
+    for o in objs:
+        o.animation_data_clear()
+        o.rotation_mode = 'QUATERNION'
+        data = captured[o.name]
+
+        ad = o.animation_data_create()
+        action = bpy.data.actions.new(name=f"{o.name}|baked")
+        slot = action.slots.new(id_type='OBJECT', name=o.name)
+        layer = action.layers.new("baked")
+        strip = layer.strips.new(type='KEYFRAME')
+        cb = strip.channelbags.new(slot)
+        ad.action = action
+        ad.action_slot = slot
+
+        write_channel(cb, data, 'location', 3, lambda d, i: d[0][i])
+        write_channel(cb, data, 'rotation_quaternion', 4, lambda d, i: d[1][i])
+        write_channel(cb, data, 'scale', 3, lambda d, i: d[2][i])
+
+        loc, rot, sc = data[rest_index]
+        o.location = loc
+        o.rotation_quaternion = rot
+        o.scale = sc
+        print(f"  re-baked {len(frames)} keys on '{o.name}' (rest at frame {frames[rest_index]})")
+
+
+def export_pyramid_source_glb(input_path, output_path):
+    """Export a pyramid-only animated source GLB from the fallback scene."""
+    clear_scene()
+    bpy.context.scene.render.fps = SOURCE_FPS
+    import_glb(input_path)
+
+    scene = bpy.context.scene
+    # The FBX render range is stale (1..250); extend to the full action range so
+    # the local-TRS re-bake below covers the whole timeline.
+    max_frame = scene.frame_end
+    for action in bpy.data.actions:
+        action_end = int(action.frame_range[1])
+        if action_end > max_frame:
+            max_frame = action_end
+    scene.frame_start = 1
+    scene.frame_end = max_frame
+
+    root = find_pyramid_root()
+    print(f"Preparing pyramid source export from root: {root.name}")
+
+    # CRITICAL: the runtime reparents the pyramids_1 root under a rotation pivot
+    # via Object3D.attach(), which rewrites the node's local transform to
+    # preserve world position. If the root node is ALSO animated, the runtime
+    # AnimationMixer overwrites that adjusted transform every frame, re-applying
+    # the root's offset on top of the pivot — shifting every pyramid particle by
+    # the root offset (~18u in Z). So the root must be frozen static.
+    #
+    # Freeze it at its MAX-SCALE frame, NOT frame_start: in the mobile FBX the
+    # root's scale animation IS the global display gate (0 before the pyramids
+    # appear, 0.01 while shown) — freezing at frame 1 bakes scale 0 and zeroes
+    # the entire chain forever (the cloud never appears). The desktop root is
+    # constant, so the max-scale frame is equivalent to any other there. The
+    # root's real in-window motion is not lost: bake_local_actions folds it
+    # into the root's direct children, so the exported chain reproduces the
+    # exact FBX world transforms under a static root (frame-locked to the VAT).
+    deps = bpy.context.evaluated_depsgraph_get()
+    best_frame = scene.frame_start
+    best_scale = -1.0
+    for f in range(scene.frame_start, scene.frame_end + 1, 7):
+        scene.frame_set(f)
+        deps.update()
+        s = max(root.evaluated_get(deps).matrix_world.to_scale())
+        if s > best_scale:
+            best_scale = s
+            best_frame = f
+    scene.frame_set(best_frame)
+    deps.update()
+    frozen_root_world = root.evaluated_get(deps).matrix_world.copy()
+    print(f"  Root freeze target: frame {best_frame}, scale {best_scale:.4f}")
+
+    removed_count = remove_pyramid_base_meshes(root)
+    print(f"  Removed {removed_count} base meshes")
+
+    subtree = collect_pyramid_subtree(root)
+
+    # Re-bake the evaluated local animation into fresh native keyframes for
+    # every animated node in the subtree except the (static, pivot-safe) root.
+    # This replaces the old `export_force_sampling=True` approach: Blender 5.2's
+    # sampler exports all-zero SCALE channels for FBX-imported slotted actions
+    # (see bake_local_actions), while pre-baked plain keyframes export verbatim.
+    # Per-frame keys also preserve the smooth LINEAR rotation curves the old
+    # force-sampling path existed for. Runs BEFORE the root freeze so the
+    # root's true motion can be folded into its direct children.
+    animated = [o for o in subtree if o is not root and o.animation_data and o.animation_data.action]
+    print(f"  Re-baking local animation on {len(animated)} nodes...")
+    bake_local_actions(animated, scene, best_frame, root, frozen_root_world)
+
+    # NOW freeze the root static at the same pose the fold was computed against.
+    scene.frame_set(best_frame)
+    deps.update()
+    if root.animation_data:
+        root.animation_data_clear()
+        print(f"  Cleared animation on root '{root.name}' (frozen at frame {best_frame})")
+
+    # Export at the display pose: for nodes WITH an action the exporter writes
+    # node TRS from the scene evaluated at the CURRENT frame (the base-TRS
+    # restore above only covers action-less nodes). The runtime builds the
+    # rotation pivot from a Box3 of these rest transforms before any mixer
+    # tick, so they must be the displayed pyramid pose, not the flown-out end
+    # pose the capture loop stopped on.
+    scene.frame_set(best_frame)
+    bpy.context.evaluated_depsgraph_get().update()
+
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in subtree:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = root
+
+    bpy.ops.export_scene.gltf(
+        filepath=output_path,
+        use_selection=True,
+        export_format='GLB',
+        export_animations=True,
+        export_animation_mode='ACTIONS',
+        # Keys are pre-baked per frame above — export them verbatim. Sampling
+        # (the old path) is what corrupted the scale channels under Blender 5.2.
+        export_force_sampling=False,
+        export_optimize_animation_size=False,
+        # Node rest TRS = the scene's current frame (parked on the root-freeze /
+        # display frame above). Without this the exporter's own ACTIONS
+        # processing leaves nodes at an arbitrary frame — the flown-out end pose
+        # — and the runtime builds the rotation pivot from a Box3 of that
+        # garbage rest, orbiting the pyramids around a phantom center on idle.
+        export_current_frame=True,
+        export_normals=True,
+        export_materials='NONE',
+        export_extras=True,
+        export_apply=False,
+        export_attributes=True,
+    )
+
+    size_kb = os.path.getsize(output_path) / 1024
+    print(f"Exported source: {output_path} ({size_kb:.1f} KB)")
+
+
+def write_vat_binary(transforms, frames, fps, n_objects, output_path, full_duration):
+    """Write transform animation data as binary.
+
+    `full_duration` is the original (untrimmed) clip length in seconds that the
+    runtime maps content-progress 0..1 across. When the static held tail is
+    trimmed, time_end (last baked frame) < full_duration; the runtime maps
+    progress to source time over full_duration, then clamps into [time_start,
+    time_end] so the morph still completes at the same scroll point.
+    """
+    n_frames = len(frames)
+    time_start = frames[0] / fps
+    time_end = frames[-1] / fps
+
+    header = struct.pack('<IIffff',
+                         n_objects,
+                         n_frames,
+                         time_start,
+                         time_end,
+                         float(fps),
+                         float(full_duration))
+    header += b'\x00' * 8  # pad header to 32 bytes
+    # Data: n_frames * n_objects * 12 floats (mat4x3 row-major)
+    payload = header + transforms.tobytes()
+
+    with open(output_path, 'wb') as f:
+        f.write(payload)
+
+    # Ship the gzipped bin: it's float32 rigid transforms with long all-zero
+    # (scale-0) runs, so gzip shrinks it ~12x losslessly (e.g. 22.9 -> 1.8 MB).
+    # The runtime fetches the .gz and inflates via DecompressionStream — far
+    # cheaper than the raw download and better than any lossy quantization, which
+    # only makes the data less compressible. mtime=0 keeps output deterministic
+    # so an identical re-bake produces no git churn.
+    gz_path = output_path + '.gz'
+    with gzip.GzipFile(gz_path, 'wb', compresslevel=9, mtime=0) as gz:
+        gz.write(payload)
+
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    gz_mb = os.path.getsize(gz_path) / (1024 * 1024)
+    print(f"VAT binary: {output_path} ({size_mb:.2f} MB)")
+    print(f"VAT gzipped: {gz_path} ({gz_mb:.2f} MB)  <- shipped to runtime")
+    print(f"  {n_objects} objects x {n_frames} frames")
+    print(f"  Baked time range: {time_start:.2f}s - {time_end:.2f}s (maps over full {full_duration:.2f}s)")
+
+
+def main():
+    print("=" * 60)
+    print("Pyramid VAT Baker (ABSOLUTE transforms)")
+    print("=" * 60)
+
+    # 1. Clear and import.
+    # Pin fps to the source fps BEFORE importing: the glTF importer places
+    # keyframes at time*fps using the scene fps at import time. GLB carries no
+    # fps (Blender defaults to 24), which would resample the 60fps source down
+    # to a ~1120-frame range. Setting it first preserves the native ~2801 frames.
+    clear_scene()
+    bpy.context.scene.render.fps = SOURCE_FPS
+    import_glb(GLB_INPUT)
+
+    scene = bpy.context.scene
+    scene.render.fps = SOURCE_FPS  # keep pinned (defensive; import shouldn't change it)
+    fps = scene.render.fps
+
+    # Extend frame range to cover full animation. Track the REAL last keyframe
+    # (anim_end_frame) separately from the +1-extended bake range: the runtime
+    # particle mixer's clip duration is the source GLB's last keyframe time
+    # (= anim_end_frame / fps), and the VAT's fullDuration must equal it exactly
+    # or the GPU solid drifts ~1 frame ahead of the CPU particles during the
+    # fast explosion. Using the extended frame_end here (one frame longer) was the
+    # bug that desynced them mid-morph.
+    max_frame = scene.frame_end
+    anim_end_frame = scene.frame_start
+    for action in bpy.data.actions:
+        last_key = int(action.frame_range[1])
+        anim_end_frame = max(anim_end_frame, last_key)
+        action_end = last_key + 1
+        if action_end > max_frame:
+            max_frame = action_end
+    scene.frame_end = max_frame
+    print(f"Scene fps: {fps}, frame range: {scene.frame_start}-{scene.frame_end}, anim end frame: {anim_end_frame}")
+
+    # 2. Find base meshes
+    base_meshes = get_pyramid_base_meshes()
+    print(f"Found {len(base_meshes)} pyramid base meshes")
+    if not base_meshes:
+        print("WARNING: No pyramid base meshes found. Skipping VAT regeneration and preserving existing VAT assets.")
+    else:
+        print(f"  First 5: {[m.name for m in base_meshes[:5]]}")
+        print(f"  Last 5: {[m.name for m in base_meshes[-5:]]}")
+
+        # 3. Determine frames
+        frames = list(range(scene.frame_start, scene.frame_end + 1, FRAME_STEP))
+        if frames[-1] != scene.frame_end:
+            frames.append(scene.frame_end)
+        print(f"Baking {len(frames)} frames (step={FRAME_STEP})")
+
+        # 4. Bake absolute world transforms (converted to Y-up)
+        print("\nBaking absolute transforms...")
+        transforms = bake_absolute_transforms(base_meshes, frames, scene)
+
+        # 4b. Trim the trailing static held pose. The source animation completes
+        # its morph partway through (the pyramids explode/fly out as the cloud
+        # transition covers them) then holds an identical pose for the rest of the
+        # clip. Baking those duplicate frames only bloats the .bin; the runtime
+        # clamps progress past the morph end to the last baked frame (see
+        # PyramidVAT.setProgress). full_duration is the REAL animation length
+        # (anim_end_frame, NOT the +1-extended frame_end) so it matches the
+        # particle mixer's GLB clip duration exactly — content-progress 0..1 maps
+        # across the same timeline for both, keeping the GPU solid and CPU
+        # particles phase-locked through the explosion.
+        full_duration = anim_end_frame / fps
+        last_motion = 0
+        for fi in range(1, len(frames)):
+            if np.abs(transforms[fi] - transforms[fi - 1]).max() > 1e-4:
+                last_motion = fi
+        keep = min(len(frames) - 1, last_motion + 1)  # +1 frame so the held pose is represented
+        if keep < len(frames) - 1:
+            print(
+                f"Trimming static tail: {len(frames)} -> {keep + 1} frames "
+                f"(last motion at baked frame {last_motion} / {(last_motion / (len(frames) - 1)):.3f} of clip)"
+            )
+            frames = frames[:keep + 1]
+            transforms = transforms[:keep + 1]
+        else:
+            print("No trailing static tail detected (motion runs to the final frame).")
+
+        # 5. Build merged mesh in LOCAL space (no world transform).
+        # Reset to rest frame first — bake_absolute_transforms left the depsgraph
+        # at the last frame, which would otherwise freeze the merged mesh in its
+        # end-of-animation pose.
+        scene.frame_set(scene.frame_start)
+        bpy.context.evaluated_depsgraph_get().update()
+        print("\nBuilding merged mesh (local space)...")
+        merged_obj, vertex_count, n_objects = build_merged_mesh(base_meshes)
+        print(f"  {vertex_count} vertices, {len(merged_obj.data.polygons)} faces, {n_objects} objects")
+
+        # 6. Export
+        print("\nExporting...")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        export_merged_glb(merged_obj, MESH_OUTPUT)
+        write_vat_binary(transforms, frames, fps, n_objects, VAT_OUTPUT, full_duration)
+
+        # 7. Cleanup merged export objects before building the source GLB
+        mesh_data = merged_obj.data
+        bpy.data.objects.remove(merged_obj, do_unlink=True)
+        bpy.data.meshes.remove(mesh_data)
+
+    # 8. Export dedicated pyramid particle source from the fallback scene
+    print("\nExporting pyramid source hierarchy...")
+    export_pyramid_source_glb(SOURCE_INPUT, SOURCE_OUTPUT)
+
+    print("\n" + "=" * 60)
+    print("SUCCESS!")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

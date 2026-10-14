@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://devclub.nst.rishihood.edu.in/sitemap.xml
